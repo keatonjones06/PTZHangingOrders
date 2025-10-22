@@ -1,0 +1,1987 @@
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Xml.Serialization;
+using NinjaTrader.Cbi;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.Gui.SuperDom;
+using NinjaTrader.Gui.Tools;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.Core.FloatingPoint;
+using NinjaTrader.NinjaScript.Indicators;
+using NinjaTrader.NinjaScript.DrawingTools;
+#endregion
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public class PTZDailyPlanStrategy : Strategy
+	{
+//		private NinjaTrader.NinjaScript.Indicators.PropTraderz.PTZDailyPlanURLv2 ptzIndicator;
+
+		private double lastCheckPrice;
+		private DateTime lastCheckTime;
+		private Dictionary<double, string> priceLevels;
+		private DateTime lastLevelUpdate;
+
+		// Track levels that have been crossed for retrace entry logic
+		private Dictionary<double, LevelCrossInfo> levelCrossTracker;
+
+		// Daily P&L tracking
+		private double dailyPnL;
+		private DateTime currentTradingDate;
+		private bool dailyLimitReached;
+
+		// Level cooldown tracking (5-minute minimum between trades at same level)
+		private Dictionary<double, DateTime> levelLastTradeTime;
+
+		// Multi-contract trailing stop management
+		private double[] trailStopPrice = new double[2];
+		private double[] highestProfitReached = new double[2];
+		private double[] lowestProfitReached = new double[2];
+
+		// Enhanced error handling for stop orders
+		private int stopOrderRetryCount;
+		private DateTime lastStopOrderAttempt;
+		private const int MAX_STOP_RETRY_ATTEMPTS = 2;
+		private const int STOP_CALCULATION_DELAY_MS = 100;
+
+		private class LevelCrossInfo
+		{
+			public bool CrossedAbove { get; set; }
+			public bool CrossedBelow { get; set; }
+			public DateTime CrossTime { get; set; }
+			public string Description { get; set; }
+		}
+
+		protected override void OnStateChange()
+		{
+			if (State == State.SetDefaults)
+			{
+				Description									= @"Trading strategy based on PTZ Daily Plan levels - buys at support/pivot bull levels, sells at resistance/pivot bear levels";
+				Name										= "PTZ Daily Plan Strategy";
+				Calculate									= Calculate.OnPriceChange;
+				EntriesPerDirection							= 1;
+				EntryHandling								= EntryHandling.AllEntries;
+				IsExitOnSessionCloseStrategy				= true;
+				ExitOnSessionCloseSeconds					= 30;
+				IsFillLimitOnTouch							= false;
+				MaximumBarsLookBack							= MaximumBarsLookBack.TwoHundredFiftySix;
+				OrderFillResolution							= OrderFillResolution.Standard;
+				Slippage									= 0;
+				StartBehavior								= StartBehavior.WaitUntilFlat;
+				TimeInForce									= TimeInForce.Gtc;
+				TraceOrders									= false;
+				RealtimeErrorHandling						= RealtimeErrorHandling.IgnoreAllErrors;
+				StopTargetHandling							= StopTargetHandling.PerEntryExecution;
+				BarsRequiredToTrade							= 20;
+				IsInstantiatedOnEachOptimizationIteration	= true;
+
+				// Strategy Parameters
+				UseSupport									= true;
+				UseResistance								= true;
+				UsePivotBull								= true;
+				UsePivotBear								= true;
+				UseStrengthConfirmed						= false;
+				UseWeaknessConfirmed						= false;
+				UseGLLevels									= true;
+
+				PriceProximityTicks							= 2;
+				TradeOnCrossover							= true;
+				TradeOnTouch								= true;
+
+				// LBL Filter
+				UseLBLFilter								= false;
+				RequireLBLInDescription						= false;
+
+				// Exit Management
+				EnableMultiContract							= false;
+				EnableStopLoss								= false;
+				StopLossTicks								= 15;
+				EnableProfitTarget							= false;
+				ProfitTargetTicks							= 20;
+				EnableTrailStop								= false;
+				TrailStopTicks								= 15;
+				EnableComplexTrailingStop					= true;
+				UsePercentageBasedTrailing					= false;
+				PercentageTrailOffset						= 0.4;
+
+				// Contract 1 Trailing Settings (Quick scalp defaults)
+				Contract1_TrailingInitialTicks				= 15;
+				Contract1_Step1Ticks						= 12;
+				Contract1_Step1TriggerTicks					= 10;
+				Contract1_Step2Ticks						= 10;
+				Contract1_Step2TriggerTicks					= 20;
+				Contract1_Step3Ticks						= 8;
+				Contract1_Step3TriggerTicks					= 30;
+
+				// Contract 2 Trailing Settings (very aggressive for runner)
+				EnableContract2Settings						= false;
+				Contract2_TrailingInitialTicks				= 12;
+				Contract2_Step1Ticks						= 10;
+				Contract2_Step1TriggerTicks					= 15;
+				Contract2_Step2Ticks						= 8;
+				Contract2_Step2TriggerTicks					= 25;
+				Contract2_Step3Ticks						= 6;
+				Contract2_Step3TriggerTicks					= 40;
+
+				MinimumStopDistanceTicks					= 5;
+				EnableStopCalculationDelay					= true;
+
+				// Keywords (must match indicator settings)
+				KeywordSupport								= "Support";
+				KeywordResistance							= "Resistance";
+				KeywordPivotBull							= "Pivot Bull";
+				KeywordPivotBear							= "Pivot Bear";
+				KeywordStrengthConfirmed					= "Strength Confirmed";
+				KeywordWeaknessConfirmed					= "Weakness Confirmed";
+				KeywordGL									= "GL";
+
+				// Time Filter (EST)
+				EnableTimeFilter							= true;
+				TradingStartHour							= 9;
+				TradingStartMinute							= 45;
+				TradingEndHour								= 15;
+				TradingEndMinute							= 45;
+
+				// Daily Limits
+				EnableDailyLossLimit						= true;
+				DailyLossLimit								= 500;
+				EnableDailyTargetLimit						= true;
+				DailyTargetLimit							= 500;
+
+				// Level Cooldown
+				EnableLevelCooldown							= true;
+				LevelCooldownMinutes						= 5;
+			}
+			else if (State == State.Configure)
+			{
+			}
+			else if (State == State.DataLoaded)
+			{
+//				ptzIndicator = PTZDailyPlanURLv2();
+//				AddChartIndicator(ptzIndicator);
+
+				lastCheckPrice = 0;
+				lastCheckTime = DateTime.MinValue;
+				priceLevels = new Dictionary<double, string>();
+				lastLevelUpdate = DateTime.MinValue;
+				levelCrossTracker = new Dictionary<double, LevelCrossInfo>();
+
+				dailyPnL = 0;
+				currentTradingDate = DateTime.MinValue;
+				dailyLimitReached = false;
+				levelLastTradeTime = new Dictionary<double, DateTime>();
+
+				trailStopPrice = new double[2];
+				highestProfitReached = new double[2];
+				lowestProfitReached = new double[2];
+				stopOrderRetryCount = 0;
+				lastStopOrderAttempt = DateTime.MinValue;
+			}
+		}
+
+		protected override void OnBarUpdate()
+		{
+			if (CurrentBar < BarsRequiredToTrade)
+				return;
+
+//			if (ptzIndicator == null)
+//				return;
+
+			try
+			{
+				if (Position.MarketPosition != MarketPosition.Flat && GetCurrentBidPrice() <= 0 && GetCurrentAskPrice() <= 0)
+				{
+					Print(string.Format("{0}: WARNING - Invalid bid/ask data while in position", Time[0]));
+					return;
+				}
+
+				// Reset daily P&L tracking on new day
+				if (Time[0].Date != currentTradingDate.Date)
+				{
+					ResetDailyTracking();
+				}
+
+				// Update daily P&L from unrealized profit/loss
+				UpdateDailyPnL();
+
+				// Check if daily limits have been reached
+				if (CheckDailyLimits())
+				{
+					if (!dailyLimitReached)
+					{
+						Print(string.Format("{0}: Daily limit reached. No new trades today. Daily P&L: {1:C}", Time[0], dailyPnL));
+						dailyLimitReached = true;
+
+						CloseAllPositionsOnError("Daily limit reached");
+					}
+					return;
+				}
+
+				// Check time filter (EST)
+				if (EnableTimeFilter && !IsWithinTradingHours())
+				{
+					return;
+				}
+
+				// Update price levels from chart drawing objects
+				if (Time[0].Date != lastLevelUpdate.Date || priceLevels.Count == 0)
+				{
+					UpdatePriceLevelsFromChart();
+					lastLevelUpdate = Time[0];
+				}
+
+				// Get current and previous price
+				double currentPrice = Close[0];
+				double previousPrice = lastCheckPrice > 0 ? lastCheckPrice : Close[Math.Max(0, CurrentBar - 1)];
+
+				// Update cross tracking for all levels
+				UpdateLevelCrossTracking(currentPrice, previousPrice);
+
+				// Manage complex trailing stop for open positions
+				if (EnableComplexTrailingStop && Position.MarketPosition != MarketPosition.Flat)
+				{
+					ManageComplexTrailingStop();
+				}
+
+				// Check for price level interactions
+				CheckForBuySignals(currentPrice, previousPrice);
+				CheckForSellSignals(currentPrice, previousPrice);
+
+				// Update last check values
+				lastCheckPrice = currentPrice;
+				lastCheckTime = Time[0];
+			}
+			catch (Exception ex)
+			{
+				Print(string.Format("{0}: CRITICAL ERROR in OnBarUpdate: {1}", Time[0], ex.Message));
+				Print(string.Format("Stack Trace: {0}", ex.StackTrace));
+				CloseAllPositionsOnError("OnBarUpdate exception");
+			}
+		}
+
+		private void UpdateLevelCrossTracking(double currentPrice, double previousPrice)
+		{
+			lock (priceLevels)
+			{
+				foreach (var level in priceLevels)
+				{
+					double levelPrice = level.Key;
+					string description = level.Value;
+
+					if (!levelCrossTracker.ContainsKey(levelPrice))
+					{
+						levelCrossTracker[levelPrice] = new LevelCrossInfo
+						{
+							CrossedAbove = false,
+							CrossedBelow = false,
+							CrossTime = DateTime.MinValue,
+							Description = description
+						};
+					}
+
+					var crossInfo = levelCrossTracker[levelPrice];
+
+					// Check if price crossed above the level
+					if (previousPrice <= levelPrice && currentPrice > levelPrice)
+					{
+						crossInfo.CrossedAbove = true;
+						crossInfo.CrossedBelow = false;
+						crossInfo.CrossTime = Time[0];
+						Print(string.Format("{0}: Price crossed ABOVE {1} at {2:F2}", Time[0], description, levelPrice));
+					}
+					// Check if price crossed below the level
+					else if (previousPrice >= levelPrice && currentPrice < levelPrice)
+					{
+						crossInfo.CrossedBelow = true;
+						crossInfo.CrossedAbove = false;
+						crossInfo.CrossTime = Time[0];
+						Print(string.Format("{0}: Price crossed BELOW {1} at {2:F2}", Time[0], description, levelPrice));
+					}
+				}
+			}
+		}
+
+		private void CheckForBuySignals(double currentPrice, double previousPrice)
+		{
+			// Don't enter new long if already long
+			if (Position.MarketPosition == MarketPosition.Long)
+				return;
+
+			// Check for buy conditions based on level descriptions
+			double buyLevelPrice = 0;
+			if (ShouldBuyAtLevel(currentPrice, previousPrice, out buyLevelPrice))
+			{
+				try
+				{
+					int contractQty = EnableMultiContract ? 2 : 1;
+					EnterLong(contractQty, "Buy at Support/Pivot Bull");
+
+					// Reset trailing stop values for all contracts
+					for (int i = 0; i < trailStopPrice.Length; i++)
+					{
+						trailStopPrice[i] = 0;
+						highestProfitReached[i] = 0;
+					}
+
+					// Mark this level as traded
+					if (EnableLevelCooldown && buyLevelPrice > 0)
+					{
+						levelLastTradeTime[buyLevelPrice] = Time[0];
+						Print(string.Format("{0}: Level {1:F2} marked - cooldown until {2}",
+							Time[0], buyLevelPrice, Time[0].AddMinutes(LevelCooldownMinutes)));
+					}
+
+					// Use standard stop/target if complex trailing is disabled
+					if (!EnableComplexTrailingStop)
+					{
+						try
+						{
+							if (EnableStopLoss)
+								SetStopLoss(CalculationMode.Ticks, StopLossTicks);
+
+							if (EnableProfitTarget)
+								SetProfitTarget(CalculationMode.Ticks, ProfitTargetTicks);
+
+							if (EnableTrailStop)
+								SetTrailStop(CalculationMode.Ticks, TrailStopTicks);
+						}
+						catch (Exception stopEx)
+						{
+							Print(string.Format("{0}: ERROR setting stops: {1} - continuing without stops", Time[0], stopEx.Message));
+						}
+					}
+				}
+				catch (Exception ex)
+				{
+					Print(string.Format("{0}: ERROR entering long position: {1}", Time[0], ex.Message));
+				}
+			}
+		}
+
+		private void CheckForSellSignals(double currentPrice, double previousPrice)
+		{
+			// Don't enter new short if already short
+			if (Position.MarketPosition == MarketPosition.Short)
+				return;
+
+			// Check for sell conditions based on level descriptions
+			double sellLevelPrice = 0;
+			if (ShouldSellAtLevel(currentPrice, previousPrice, out sellLevelPrice))
+			{
+				try
+				{
+					int contractQty = EnableMultiContract ? 2 : 1;
+					EnterShort(contractQty, "Sell at Resistance/Pivot Bear");
+
+					// Reset trailing stop values for all contracts
+					for (int i = 0; i < trailStopPrice.Length; i++)
+					{
+						trailStopPrice[i] = 0;
+						lowestProfitReached[i] = 0;
+					}
+
+					// Mark this level as traded
+					if (EnableLevelCooldown && sellLevelPrice > 0)
+					{
+						levelLastTradeTime[sellLevelPrice] = Time[0];
+						Print(string.Format("{0}: Level {1:F2} marked - cooldown until {2}",
+							Time[0], sellLevelPrice, Time[0].AddMinutes(LevelCooldownMinutes)));
+					}
+
+					// Use standard stop/target if complex trailing is disabled
+					if (!EnableComplexTrailingStop)
+					{
+						try
+						{
+							if (EnableStopLoss)
+								SetStopLoss(CalculationMode.Ticks, StopLossTicks);
+
+							if (EnableProfitTarget)
+								SetProfitTarget(CalculationMode.Ticks, ProfitTargetTicks);
+
+							if (EnableTrailStop)
+								SetTrailStop(CalculationMode.Ticks, TrailStopTicks);
+						}
+						catch (Exception stopEx)
+						{
+							Print(string.Format("{0}: ERROR setting stops: {1} - continuing without stops", Time[0], stopEx.Message));
+						}
+					}
+				}
+				catch (Exception ex)
+				{
+					Print(string.Format("{0}: ERROR entering short position: {1}", Time[0], ex.Message));
+				}
+			}
+		}
+
+		private void UpdatePriceLevelsFromChart()
+		{
+			priceLevels.Clear();
+
+			if (ChartControl == null || ChartPanel == null)
+			{
+				Print(string.Format("{0}: ChartControl is null - strategy must be run on a chart", Time[0]));
+				return;
+			}
+
+			try
+			{
+				// First, collect all Text objects to build a description lookup by price
+				Dictionary<double, string> textDescriptionsByPrice = new Dictionary<double, string>();
+
+				// First, try to get drawing objects from DrawObjects collection (indicator-drawn objects)
+				if (DrawObjects != null && DrawObjects.Count > 0)
+				{
+					Print(string.Format("{0}: Scanning {1} objects in DrawObjects collection", Time[0], DrawObjects.Count));
+
+					// Count object types for diagnostics
+					Dictionary<string, int> objectTypeCounts = new Dictionary<string, int>();
+
+					// First pass: collect all text descriptions
+					foreach (var drawObject in DrawObjects)
+					{
+						if (drawObject == null)
+							continue;
+
+						// Track object types
+						string typeName = drawObject.GetType().Name;
+						if (!objectTypeCounts.ContainsKey(typeName))
+							objectTypeCounts[typeName] = 0;
+						objectTypeCounts[typeName]++;
+
+						if (drawObject is NinjaTrader.NinjaScript.DrawingTools.Text)
+						{
+							var text = drawObject as NinjaTrader.NinjaScript.DrawingTools.Text;
+							double textPrice = text.Anchor.Price;
+							string displayText = text.DisplayText ?? text.Tag ?? string.Empty;
+
+							if (!string.IsNullOrEmpty(displayText))
+							{
+								// Round to nearest tick to match with lines
+								double roundedPrice = Math.Round(textPrice / TickSize) * TickSize;
+								textDescriptionsByPrice[roundedPrice] = displayText;
+								Print(string.Format("  Found Text at {0:F2}: {1}", roundedPrice, displayText));
+							}
+						}
+					}
+
+					// Print object type summary
+					Print("  DrawObject type summary:");
+					foreach (var kvp in objectTypeCounts)
+					{
+						Print(string.Format("    {0}: {1}", kvp.Key, kvp.Value));
+					}
+
+					// NEW: Inspect ALL objects that have "HorizontalLine" in their type name
+					Print(string.Format("{0}: *** INSPECTING ALL OBJECTS WITH 'HorizontalLine' IN TYPE NAME ***", Time[0]));
+					int hLineCount = 0;
+					int inspectCount = 0;
+					foreach (var drawObject in DrawObjects)
+					{
+						if (drawObject != null)
+						{
+							string typeName = drawObject.GetType().Name;
+							string fullTypeName = drawObject.GetType().FullName;
+
+							// Check if this is a HorizontalLine
+							if (typeName.Contains("HorizontalLine") || fullTypeName.Contains("HorizontalLine"))
+							{
+								hLineCount++;
+
+								if (inspectCount < 10)
+								{
+									Print(string.Format("  Object #{0}:", inspectCount + 1));
+									Print(string.Format("    Type: {0}", typeName));
+									Print(string.Format("    FullType: {0}", fullTypeName));
+
+									// Try to access common properties via reflection
+									try
+									{
+										var objType = drawObject.GetType();
+
+										// Try StartAnchor.Price
+										var startAnchorProp = objType.GetProperty("StartAnchor");
+										if (startAnchorProp != null)
+										{
+											var startAnchor = startAnchorProp.GetValue(drawObject);
+											if (startAnchor != null)
+											{
+												var priceProp = startAnchor.GetType().GetProperty("Price");
+												if (priceProp != null)
+												{
+													double price = (double)priceProp.GetValue(startAnchor);
+													Print(string.Format("    Price: {0:F2}", price));
+												}
+											}
+										}
+
+										// Try Tag
+										var tagProp = objType.GetProperty("Tag");
+										if (tagProp != null)
+										{
+											string tag = tagProp.GetValue(drawObject)?.ToString() ?? "NO_TAG";
+											Print(string.Format("    Tag: '{0}'", tag));
+										}
+
+										// Try Name
+										var nameProp = objType.GetProperty("Name");
+										if (nameProp != null)
+										{
+											string name = nameProp.GetValue(drawObject)?.ToString() ?? "";
+											Print(string.Format("    Name: '{0}'", name));
+										}
+									}
+									catch (Exception ex)
+									{
+										Print(string.Format("    Error accessing properties: {0}", ex.Message));
+									}
+
+									inspectCount++;
+								}
+							}
+						}
+					}
+					Print(string.Format("  Total objects with 'HorizontalLine' in name: {0}", hLineCount));
+
+					// Second pass: Extract all HorizontalLine levels with their descriptions from Tags
+					Print(string.Format("{0}: *** EXTRACTING PRICE LEVELS FROM TAGS ***", Time[0]));
+					int levelsExtracted = 0;
+					foreach (var drawObject in DrawObjects)
+					{
+						if (drawObject == null)
+							continue;
+
+						string typeName = drawObject.GetType().Name;
+						if (typeName == "HorizontalLine")
+						{
+							try
+							{
+								var objType = drawObject.GetType();
+
+								// Get Price from StartAnchor
+								double priceLevel = 0;
+								var startAnchorProp = objType.GetProperty("StartAnchor");
+								if (startAnchorProp != null)
+								{
+									var startAnchor = startAnchorProp.GetValue(drawObject);
+									if (startAnchor != null)
+									{
+										var priceProp = startAnchor.GetType().GetProperty("Price");
+										if (priceProp != null)
+										{
+											priceLevel = (double)priceProp.GetValue(startAnchor);
+										}
+									}
+								}
+
+								// Get Tag
+								string tag = string.Empty;
+								var tagProp = objType.GetProperty("Tag");
+								if (tagProp != null)
+								{
+									tag = tagProp.GetValue(drawObject)?.ToString() ?? string.Empty;
+								}
+
+								if (priceLevel > 0 && !string.IsNullOrEmpty(tag))
+								{
+									// Parse the tag to extract description
+									// Format: "LBL=Support: 24633|PTZDPHLine" or "GL: 25326|GOLDPTZDPHLine"
+									string description = tag;
+
+									// Remove the |PTZDPHLine or |GOLDPTZDPHLine suffix
+									if (tag.Contains("|PTZDPHLine") || tag.Contains("|GOLDPTZDPHLine"))
+									{
+										description = tag.Split('|')[0].Trim();
+									}
+
+									// Remove the LBL= prefix
+									if (description.StartsWith("LBL="))
+									{
+										description = description.Substring(4).Trim();
+									}
+
+									lock (priceLevels)
+									{
+										if (!priceLevels.ContainsKey(priceLevel))
+										{
+											priceLevels[priceLevel] = description;
+											levelsExtracted++;
+
+											// Print first 10 for debugging
+											if (levelsExtracted <= 10)
+											{
+												Print(string.Format("  Level {0}: {1:F2} - {2}", levelsExtracted, priceLevel, description));
+											}
+										}
+									}
+								}
+							}
+							catch (Exception ex)
+							{
+								Print(string.Format("  Error extracting level: {0}", ex.Message));
+							}
+						}
+					}
+					Print(string.Format("  Total levels extracted: {0}", levelsExtracted));
+				}
+
+				// Also scan ChartControl.ChartObjects for manually drawn objects
+				// IMPORTANT: This is where Chart Objects window shows the objects
+				ChartControl.Dispatcher.InvokeAsync(() =>
+				{
+					try
+					{
+						if (ChartControl.ChartObjects != null && ChartControl.ChartObjects.Count > 0)
+						{
+							Print(string.Format("{0}: *** Scanning {1} objects in ChartObjects (Chart Objects Window) ***", Time[0], ChartControl.ChartObjects.Count));
+
+							// Find the PTZDailyPlanURLv2 indicator in ChartObjects
+							object ptzIndicator = null;
+							foreach (var chartObject in ChartControl.ChartObjects.ToList())
+							{
+								if (chartObject != null && chartObject.GetType().Name == "PTZDailyPlanURLv2")
+								{
+									ptzIndicator = chartObject;
+									Print(string.Format("  Found PTZDailyPlanURLv2 indicator in ChartObjects!"));
+
+									// Try to access the indicator's public properties/methods using reflection
+									try
+									{
+										var indicatorType = ptzIndicator.GetType();
+										var properties = indicatorType.GetProperties();
+
+										Print(string.Format("  PTZDailyPlanURLv2 has {0} properties:", properties.Length));
+
+										// Look for properties that might contain collection/dictionary of levels
+										foreach (var prop in properties)
+										{
+											string propName = prop.Name;
+											var propType = prop.PropertyType;
+
+											// Look for collections, dictionaries, or arrays that might store level data
+											bool isCollection = propType.IsGenericType &&
+											    (propType.GetGenericTypeDefinition() == typeof(Dictionary<,>) ||
+											     propType.GetGenericTypeDefinition() == typeof(List<>) ||
+											     propType.Name.Contains("Collection"));
+
+											bool isArray = propType.IsArray;
+
+											// Look for properties with relevant names or collection types
+											if (isCollection || isArray ||
+											    propName.Contains("Level") || propName.Contains("Price") ||
+											    propName.Contains("Support") || propName.Contains("Resistance") ||
+											    propName.Contains("Pivot") || propName.Contains("Bull") || propName.Contains("Bear") ||
+											    propName.Contains("Line") || propName.Contains("Zone") || propName.Contains("Data"))
+											{
+												try
+												{
+													var value = prop.GetValue(ptzIndicator);
+													string valueStr = value?.ToString() ?? "null";
+													string typeStr = propType.Name;
+
+													// If it's a collection, show count
+													if (value != null)
+													{
+														if (value is System.Collections.ICollection collection)
+														{
+															valueStr = string.Format("{0} (Count: {1})", typeStr, collection.Count);
+														}
+														else if (value is System.Collections.IDictionary dict)
+														{
+															valueStr = string.Format("{0} (Count: {1})", typeStr, dict.Count);
+														}
+													}
+
+													Print(string.Format("    Property '{0}' [{1}] = {2}", propName, typeStr, valueStr));
+												}
+												catch (Exception ex)
+												{
+													Print(string.Format("    Property '{0}' - Error: {1}", propName, ex.Message));
+												}
+											}
+										}
+
+										// Also check for common indicator value series
+										var valuesProperty = indicatorType.GetProperty("Values");
+										if (valuesProperty != null)
+										{
+											var values = valuesProperty.GetValue(ptzIndicator);
+											if (values != null)
+											{
+												Print(string.Format("  Indicator has Values collection: {0}", values.GetType().Name));
+											}
+										}
+									}
+									catch (Exception ex)
+									{
+										Print(string.Format("  Error inspecting PTZDailyPlanURLv2: {0}", ex.Message));
+									}
+									break;
+								}
+							}
+
+							if (ptzIndicator == null)
+							{
+								Print("  WARNING: PTZDailyPlanURLv2 indicator not found in ChartObjects");
+							}
+
+							// Count types in ChartObjects
+							Dictionary<string, int> chartObjectTypeCounts = new Dictionary<string, int>();
+							foreach (var drawObject in ChartControl.ChartObjects.ToList())
+							{
+								if (drawObject != null)
+								{
+									string typeName = drawObject.GetType().Name;
+									if (!chartObjectTypeCounts.ContainsKey(typeName))
+										chartObjectTypeCounts[typeName] = 0;
+									chartObjectTypeCounts[typeName]++;
+								}
+							}
+
+							Print("  ChartObject type summary:");
+							foreach (var kvp in chartObjectTypeCounts)
+							{
+								Print(string.Format("    {0}: {1}", kvp.Key, kvp.Value));
+							}
+
+							// NEW: Inspect first 10 HorizontalLine objects to find price levels
+							Print(string.Format("{0}: *** INSPECTING HORIZONTAL LINES FOR PRICE LEVELS ***", Time[0]));
+							int hLineCount = 0;
+							foreach (var drawObject in ChartControl.ChartObjects.ToList())
+							{
+								if (drawObject != null && drawObject is NinjaTrader.NinjaScript.DrawingTools.HorizontalLine)
+								{
+									hLineCount++;
+									if (hLineCount <= 10)
+									{
+										var hLine = drawObject as NinjaTrader.NinjaScript.DrawingTools.HorizontalLine;
+										double price = hLine.StartAnchor.Price;
+										string tag = hLine.Tag ?? "NO_TAG";
+
+										Print(string.Format("  HLine #{0}: Price={1:F2}, Tag='{2}'", hLineCount, price, tag));
+
+										// Try to find nearby text objects within 5 ticks
+										double proximityInPrice = 5 * TickSize;
+										foreach (var textObj in ChartControl.ChartObjects.ToList())
+										{
+											if (textObj != null && textObj is NinjaTrader.NinjaScript.DrawingTools.Text)
+											{
+												var text = textObj as NinjaTrader.NinjaScript.DrawingTools.Text;
+												double textPrice = text.Anchor.Price;
+
+												if (Math.Abs(textPrice - price) <= proximityInPrice)
+												{
+													string displayText = text.DisplayText ?? text.Tag ?? "";
+													Print(string.Format("    -> Found nearby text at {0:F2}: '{1}'", textPrice, displayText));
+												}
+											}
+										}
+									}
+								}
+							}
+							Print(string.Format("  Total HorizontalLines found: {0}", hLineCount));
+
+							// First pass: collect text descriptions from ChartObjects
+							Dictionary<double, string> chartTextDescriptions = new Dictionary<double, string>();
+							int chartDebugCount = 0;
+							foreach (var drawObject in ChartControl.ChartObjects.ToList())
+							{
+								if (drawObject == null)
+									continue;
+
+								if (drawObject is NinjaTrader.NinjaScript.DrawingTools.Text)
+								{
+									var text = drawObject as NinjaTrader.NinjaScript.DrawingTools.Text;
+									double textPrice = text.Anchor.Price;
+									string displayText = text.DisplayText ?? text.Tag ?? string.Empty;
+
+									if (!string.IsNullOrEmpty(displayText))
+									{
+										double roundedPrice = Math.Round(textPrice / TickSize) * TickSize;
+										chartTextDescriptions[roundedPrice] = displayText;
+										Print(string.Format("  Found ChartObject Text at {0:F2}: {1}", roundedPrice, displayText));
+									}
+								}
+
+								// Debug HorizontalLines from ChartObjects
+								if (drawObject is NinjaTrader.NinjaScript.DrawingTools.HorizontalLine && chartDebugCount < 5)
+								{
+									var hLine = drawObject as NinjaTrader.NinjaScript.DrawingTools.HorizontalLine;
+									try
+									{
+										string tag = hLine.Tag ?? "";
+										string name = "";
+										try { name = hLine.GetType().GetProperty("Name")?.GetValue(hLine)?.ToString() ?? ""; } catch { }
+
+										Print(string.Format("  DEBUG ChartObject HorizontalLine #{0}:", chartDebugCount + 1));
+										Print(string.Format("    Price={0:F2}", hLine.StartAnchor.Price));
+										Print(string.Format("    Tag='{0}'", tag));
+										Print(string.Format("    Name='{0}'", name));
+									}
+									catch (Exception ex)
+									{
+										Print(string.Format("  DEBUG ChartObject Error: {0}", ex.Message));
+									}
+									chartDebugCount++;
+								}
+							}
+
+							// Second pass: process lines and match with text
+							foreach (var drawObject in ChartControl.ChartObjects.ToList())
+							{
+								if (drawObject == null)
+									continue;
+
+								string tag = string.Empty;
+								double priceLevel = 0;
+								string description = string.Empty;
+
+								if (drawObject is NinjaTrader.NinjaScript.DrawingTools.Line)
+								{
+									var line = drawObject as NinjaTrader.NinjaScript.DrawingTools.Line;
+									priceLevel = line.StartAnchor.Price;
+									tag = line.Tag ?? string.Empty;
+									description = tag;
+								}
+								else if (drawObject is NinjaTrader.NinjaScript.DrawingTools.HorizontalLine)
+								{
+									var hLine = drawObject as NinjaTrader.NinjaScript.DrawingTools.HorizontalLine;
+									priceLevel = hLine.StartAnchor.Price;
+									tag = hLine.Tag ?? string.Empty;
+									description = tag;
+								}
+								else if (drawObject is NinjaTrader.NinjaScript.DrawingTools.Ray)
+								{
+									var ray = drawObject as NinjaTrader.NinjaScript.DrawingTools.Ray;
+									priceLevel = ray.StartAnchor.Price;
+									tag = ray.Tag ?? string.Empty;
+									description = tag;
+								}
+
+								if (priceLevel > 0)
+								{
+									// If no description from tag, look for nearby text within 2 ticks
+									if (string.IsNullOrEmpty(description))
+									{
+										double roundedPrice = Math.Round(priceLevel / TickSize) * TickSize;
+
+										// Try exact match first
+										if (chartTextDescriptions.ContainsKey(roundedPrice))
+										{
+											description = chartTextDescriptions[roundedPrice];
+										}
+										else
+										{
+											// Try within 2 ticks
+											double proximityInPrice = 2 * TickSize;
+											foreach (var kvp in chartTextDescriptions)
+											{
+												if (Math.Abs(kvp.Key - roundedPrice) <= proximityInPrice)
+												{
+													description = kvp.Value;
+													break;
+												}
+											}
+										}
+									}
+
+									if (!string.IsNullOrEmpty(description))
+									{
+										lock (priceLevels)
+										{
+											if (!priceLevels.ContainsKey(priceLevel))
+											{
+												priceLevels[priceLevel] = description;
+												Print(string.Format("  Added from ChartObjects: {0:F2} - {1}", priceLevel, description));
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+					catch (Exception ex)
+					{
+						Print(string.Format("Error in ChartObjects Dispatcher: {0}", ex.Message));
+					}
+				});
+
+				// Give dispatcher time to complete
+				System.Threading.Thread.Sleep(100);
+
+				int levelCount = 0;
+				lock (priceLevels)
+				{
+					levelCount = priceLevels.Count;
+				}
+
+				if (levelCount > 0)
+				{
+					Print(string.Format("{0}: Successfully loaded {1} price levels", Time[0], levelCount));
+
+					// Print details of each level for debugging
+					lock (priceLevels)
+					{
+						foreach (var level in priceLevels)
+						{
+							Print(string.Format("  Active Level: {0:F2} - {1}", level.Key, level.Value));
+						}
+					}
+				}
+				else
+				{
+					Print(string.Format("{0}: WARNING - No price levels found. Check:", Time[0]));
+					Print("  1. Indicator is loaded on the chart");
+					Print("  2. Indicator has drawn levels with text labels");
+					Print("  3. Drawing objects have tags or text descriptions");
+					Print(string.Format("  DrawObjects count: {0}", DrawObjects != null ? DrawObjects.Count : 0));
+				}
+			}
+			catch (Exception ex)
+			{
+				Print(string.Format("Error updating price levels: {0}", ex.Message));
+				Print(string.Format("Stack trace: {0}", ex.StackTrace));
+			}
+		}
+
+		private void ResetDailyTracking()
+		{
+			currentTradingDate = Time[0].Date;
+			dailyPnL = 0;
+			dailyLimitReached = false;
+			Print(string.Format("{0}: New trading day started. Daily limits reset.", Time[0]));
+		}
+
+		private void UpdateDailyPnL()
+		{
+			try
+			{
+				double unrealizedPnL = Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency, Close[0]);
+				double realizedPnL = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+
+				// Calculate daily P&L
+				dailyPnL = realizedPnL + unrealizedPnL;
+			}
+			catch (Exception ex)
+			{
+				Print(string.Format("{0}: ERROR updating daily P&L: {1}", Time[0], ex.Message));
+			}
+		}
+
+		private bool CheckDailyLimits()
+		{
+			if (EnableDailyLossLimit && dailyPnL <= -DailyLossLimit)
+			{
+				return true;
+			}
+
+			if (EnableDailyTargetLimit && dailyPnL >= DailyTargetLimit)
+			{
+				return true;
+			}
+
+			return false;
+		}
+
+		private bool IsWithinTradingHours()
+		{
+			try
+			{
+				// Convert current time to EST
+				TimeZoneInfo estZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+				DateTime estTime = TimeZoneInfo.ConvertTime(Time[0], estZone);
+
+				int currentHour = estTime.Hour;
+				int currentMinute = estTime.Minute;
+
+				// Check if before trading start
+				if (currentHour < TradingStartHour ||
+					(currentHour == TradingStartHour && currentMinute < TradingStartMinute))
+				{
+					return false;
+				}
+
+				// Check if after trading end
+				if (currentHour > TradingEndHour ||
+					(currentHour == TradingEndHour && currentMinute >= TradingEndMinute))
+				{
+					return false;
+				}
+
+				return true;
+			}
+			catch (Exception ex)
+			{
+				Print(string.Format("{0}: ERROR checking trading hours: {1}", Time[0], ex.Message));
+				return true;
+			}
+		}
+
+		private bool IsLevelOnCooldown(double levelPrice)
+		{
+			if (!EnableLevelCooldown)
+				return false;
+
+			if (levelLastTradeTime.ContainsKey(levelPrice))
+			{
+				DateTime lastTradeTime = levelLastTradeTime[levelPrice];
+				TimeSpan timeSinceLastTrade = Time[0] - lastTradeTime;
+
+				if (timeSinceLastTrade.TotalMinutes < LevelCooldownMinutes)
+				{
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		private void ManageComplexTrailingStop()
+		{
+			try
+			{
+				if (Position.MarketPosition == MarketPosition.Flat)
+				{
+					stopOrderRetryCount = 0;
+					return;
+				}
+
+				if (EnableStopCalculationDelay)
+				{
+					TimeSpan timeSinceLastAttempt = Time[0] - lastStopOrderAttempt;
+					if (timeSinceLastAttempt.TotalMilliseconds < STOP_CALCULATION_DELAY_MS)
+					{
+						return;
+					}
+				}
+
+				double currentBid = GetCurrentBidPrice();
+				double currentAsk = GetCurrentAskPrice();
+
+				if (currentBid <= 0 || currentAsk <= 0)
+				{
+					Print(string.Format("{0}: Skipping stop update - invalid bid/ask", Time[0]));
+					return;
+				}
+
+				double currentPrice = Close[0];
+				double unrealizedProfitTicks = 0;
+
+				if (Position.MarketPosition == MarketPosition.Long)
+				{
+					unrealizedProfitTicks = (currentBid - Position.AveragePrice) / TickSize;
+
+					if (!EnableMultiContract || Position.Quantity == 1)
+					{
+						ManageSingleContractTrail(currentPrice, unrealizedProfitTicks, MarketPosition.Long, 0);
+					}
+					else
+					{
+						for (int i = 0; i < Math.Min(Position.Quantity, 2); i++)
+						{
+							ManageSingleContractTrail(currentPrice, unrealizedProfitTicks, MarketPosition.Long, i);
+						}
+					}
+				}
+				else if (Position.MarketPosition == MarketPosition.Short)
+				{
+					unrealizedProfitTicks = (Position.AveragePrice - currentAsk) / TickSize;
+
+					if (!EnableMultiContract || Position.Quantity == 1)
+					{
+						ManageSingleContractTrail(currentPrice, unrealizedProfitTicks, MarketPosition.Short, 0);
+					}
+					else
+					{
+						for (int i = 0; i < Math.Min(Position.Quantity, 2); i++)
+						{
+							ManageSingleContractTrail(currentPrice, unrealizedProfitTicks, MarketPosition.Short, i);
+						}
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				Print(string.Format("{0}: ERROR managing trailing stop: {1}", Time[0], ex.Message));
+				CloseAllPositionsOnError("Trailing stop management error");
+			}
+		}
+
+		private void ManageSingleContractTrail(double currentPrice, double unrealizedProfitTicks, MarketPosition position, int contractIndex)
+		{
+			try
+			{
+				int initialTicks, step1Ticks, step1Trigger, step2Ticks, step2Trigger, step3Ticks, step3Trigger;
+
+				if (contractIndex == 1 && EnableContract2Settings && EnableMultiContract)
+				{
+					initialTicks = Contract2_TrailingInitialTicks;
+					step1Ticks = Contract2_Step1Ticks;
+					step1Trigger = Contract2_Step1TriggerTicks;
+					step2Ticks = Contract2_Step2Ticks;
+					step2Trigger = Contract2_Step2TriggerTicks;
+					step3Ticks = Contract2_Step3Ticks;
+					step3Trigger = Contract2_Step3TriggerTicks;
+				}
+				else
+				{
+					initialTicks = Contract1_TrailingInitialTicks;
+					step1Ticks = Contract1_Step1Ticks;
+					step1Trigger = Contract1_Step1TriggerTicks;
+					step2Ticks = Contract1_Step2Ticks;
+					step2Trigger = Contract1_Step2TriggerTicks;
+					step3Ticks = Contract1_Step3Ticks;
+					step3Trigger = Contract1_Step3TriggerTicks;
+				}
+
+				double trailDistance = initialTicks;
+
+				if (position == MarketPosition.Long)
+				{
+					if (unrealizedProfitTicks > highestProfitReached[contractIndex])
+					{
+						highestProfitReached[contractIndex] = unrealizedProfitTicks;
+					}
+
+					if (UsePercentageBasedTrailing)
+					{
+						trailDistance = Math.Max(
+							(Position.AveragePrice * PercentageTrailOffset / 100.0) / TickSize,
+							MinimumStopDistanceTicks + 3
+						);
+					}
+					else
+					{
+						if (highestProfitReached[contractIndex] >= step3Trigger)
+							trailDistance = step3Ticks;
+						else if (highestProfitReached[contractIndex] >= step2Trigger)
+							trailDistance = step2Ticks;
+						else if (highestProfitReached[contractIndex] >= step1Trigger)
+							trailDistance = step1Ticks;
+					}
+
+					double currentBid = GetCurrentBidPrice();
+					double maxAllowedStop = currentBid - ((MinimumStopDistanceTicks + 2) * TickSize);
+					double newStopPrice = currentBid - (trailDistance * TickSize);
+
+					if (newStopPrice > maxAllowedStop)
+					{
+						Print(string.Format("{0}: LONG stop calculation too close to bid - skipping update (calculated: {1:F2}, max: {2:F2})",
+							Time[0], newStopPrice, maxAllowedStop));
+						return;
+					}
+
+					if (trailStopPrice[contractIndex] == 0 || newStopPrice > trailStopPrice[contractIndex])
+					{
+						trailStopPrice[contractIndex] = newStopPrice;
+
+						if (TrySetStopLoss(trailStopPrice[contractIndex], MarketPosition.Long, currentPrice))
+						{
+							stopOrderRetryCount = 0;
+							lastStopOrderAttempt = Time[0];
+							string contractLabel = EnableMultiContract ? string.Format(" Contract {0}", contractIndex + 1) : "";
+							Print(string.Format("{0}:{1} LONG Trailing Stop → {2:F2} (Bid: {3:F2}, Trail: {4} ticks, Profit: {5:F1})",
+								Time[0], contractLabel, trailStopPrice[contractIndex], currentBid, trailDistance, unrealizedProfitTicks));
+						}
+					}
+				}
+				else if (position == MarketPosition.Short)
+				{
+					if (unrealizedProfitTicks > lowestProfitReached[contractIndex])
+					{
+						lowestProfitReached[contractIndex] = unrealizedProfitTicks;
+					}
+
+					if (UsePercentageBasedTrailing)
+					{
+						trailDistance = Math.Max(
+							(Position.AveragePrice * PercentageTrailOffset / 100.0) / TickSize,
+							MinimumStopDistanceTicks + 3
+						);
+					}
+					else
+					{
+						if (lowestProfitReached[contractIndex] >= step3Trigger)
+							trailDistance = step3Ticks;
+						else if (lowestProfitReached[contractIndex] >= step2Trigger)
+							trailDistance = step2Ticks;
+						else if (lowestProfitReached[contractIndex] >= step1Trigger)
+							trailDistance = step1Ticks;
+					}
+
+					double currentAsk = GetCurrentAskPrice();
+					double minAllowedStop = currentAsk + ((MinimumStopDistanceTicks + 2) * TickSize);
+					double newStopPrice = currentAsk + (trailDistance * TickSize);
+
+					if (newStopPrice < minAllowedStop)
+					{
+						Print(string.Format("{0}: SHORT stop calculation too close to ask - skipping update (calculated: {1:F2}, min: {2:F2})",
+							Time[0], newStopPrice, minAllowedStop));
+						return;
+					}
+
+					if (trailStopPrice[contractIndex] == 0 || newStopPrice < trailStopPrice[contractIndex])
+					{
+						trailStopPrice[contractIndex] = newStopPrice;
+
+						if (TrySetStopLoss(trailStopPrice[contractIndex], MarketPosition.Short, currentPrice))
+						{
+							stopOrderRetryCount = 0;
+							lastStopOrderAttempt = Time[0];
+							string contractLabel = EnableMultiContract ? string.Format(" Contract {0}", contractIndex + 1) : "";
+							Print(string.Format("{0}:{1} SHORT Trailing Stop → {2:F2} (Ask: {3:F2}, Trail: {4} ticks, Profit: {5:F1})",
+								Time[0], contractLabel, trailStopPrice[contractIndex], currentAsk, trailDistance, unrealizedProfitTicks));
+						}
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				Print(string.Format("{0}: CRITICAL ERROR in contract {1} trail: {2}", Time[0], contractIndex + 1, ex.Message));
+				CloseAllPositionsOnError("Trail calculation failed");
+			}
+		}
+
+		private bool TrySetStopLoss(double stopPrice, MarketPosition position, double currentPrice)
+		{
+			try
+			{
+				double currentBid = GetCurrentBidPrice();
+				double currentAsk = GetCurrentAskPrice();
+				bool isValidStop = false;
+
+				if (position == MarketPosition.Short)
+				{
+					double minAllowedStop = currentAsk + ((MinimumStopDistanceTicks + 2) * TickSize);
+
+					if (stopPrice >= minAllowedStop)
+					{
+						isValidStop = true;
+					}
+					else
+					{
+						Print(string.Format("{0}: SHORT stop {1:F2} REJECTED - must be >= {2:F2} (Ask: {3:F2} + {4} ticks)",
+							Time[0], stopPrice, minAllowedStop, currentAsk, MinimumStopDistanceTicks + 2));
+						CloseAllPositionsOnError("SHORT stop below ask - invalid");
+						return false;
+					}
+				}
+				else if (position == MarketPosition.Long)
+				{
+					double maxAllowedStop = currentBid - ((MinimumStopDistanceTicks + 2) * TickSize);
+
+					if (stopPrice <= maxAllowedStop)
+					{
+						isValidStop = true;
+					}
+					else
+					{
+						Print(string.Format("{0}: LONG stop {1:F2} REJECTED - must be <= {2:F2} (Bid: {3:F2} - {4} ticks)",
+							Time[0], stopPrice, maxAllowedStop, currentBid, MinimumStopDistanceTicks + 2));
+						CloseAllPositionsOnError("LONG stop above bid - invalid");
+						return false;
+					}
+				}
+
+				if (isValidStop)
+				{
+					try
+					{
+						SetStopLoss("", CalculationMode.Price, stopPrice, false);
+						return true;
+					}
+					catch (Exception setStopEx)
+					{
+						Print(string.Format("{0}: *** SetStopLoss REJECTED BY NINJATRADER *** - Price: {1:F2}, Position: {2}, Error: {3}",
+							Time[0], stopPrice, position, setStopEx.Message));
+						Print(string.Format("{0}: Market state - Bid: {1:F2}, Ask: {2:F2}, Close: {3:F2}",
+							Time[0], currentBid, currentAsk, currentPrice));
+
+						CloseAllPositionsOnError("Stop order rejected by NT");
+						return false;
+					}
+				}
+
+				return false;
+			}
+			catch (Exception ex)
+			{
+				Print(string.Format("{0}: CRITICAL ERROR in TrySetStopLoss: {1}", Time[0], ex.Message));
+				CloseAllPositionsOnError("Stop calculation error");
+				return false;
+			}
+		}
+
+		private double GetCurrentBidPrice()
+		{
+			try
+			{
+				double bid = GetCurrentBid();
+				if (bid > 0)
+					return bid;
+				return Close[0];
+			}
+			catch
+			{
+				return Close[0];
+			}
+		}
+
+		private double GetCurrentAskPrice()
+		{
+			try
+			{
+				double ask = GetCurrentAsk();
+				if (ask > 0)
+					return ask;
+				return Close[0];
+			}
+			catch
+			{
+				return Close[0];
+			}
+		}
+
+		private void CloseAllPositionsOnError(string reason)
+		{
+			try
+			{
+				if (Position.MarketPosition != MarketPosition.Flat)
+				{
+					Print(string.Format("{0}: *** EMERGENCY CLOSE *** - Reason: {1}", Time[0], reason));
+					Print(string.Format("{0}: Position Details - {1} {2} contracts at {3:F2}",
+						Time[0], Position.MarketPosition, Position.Quantity, Position.AveragePrice));
+
+					try
+					{
+						SetStopLoss("", CalculationMode.Price, 0, false);
+						SetProfitTarget("", CalculationMode.Price, 0);
+					}
+					catch
+					{
+					}
+
+					if (Position.MarketPosition == MarketPosition.Long)
+					{
+						ExitLong("Emergency Exit Long");
+						Print(string.Format("{0}: Issued ExitLong() market order", Time[0]));
+					}
+					else if (Position.MarketPosition == MarketPosition.Short)
+					{
+						ExitShort("Emergency Exit Short");
+						Print(string.Format("{0}: Issued ExitShort() market order", Time[0]));
+					}
+
+					for (int i = 0; i < trailStopPrice.Length; i++)
+					{
+						trailStopPrice[i] = 0;
+						highestProfitReached[i] = 0;
+						lowestProfitReached[i] = 0;
+					}
+
+					stopOrderRetryCount = 0;
+
+					Print(string.Format("{0}: All positions closed, stops cleared", Time[0]));
+				}
+			}
+			catch (Exception ex)
+			{
+				Print(string.Format("{0}: *** CRITICAL ERROR closing positions: {1} ***", Time[0], ex.Message));
+			}
+		}
+
+		private bool ShouldBuyAtLevel(double currentPrice, double previousPrice, out double levelPrice)
+		{
+			levelPrice = 0;
+
+			lock (priceLevels)
+			{
+				if (priceLevels.Count == 0)
+					return false;
+
+				double proximity = PriceProximityTicks * TickSize;
+
+				foreach (var level in priceLevels)
+				{
+					double currentLevelPrice = level.Key;
+					string description = level.Value.ToLower();
+
+					// Check if level is on cooldown
+					if (IsLevelOnCooldown(currentLevelPrice))
+					{
+						continue;
+					}
+
+					// DIAGNOSTIC: Print what we're checking
+					Print(string.Format("{0}: Checking BUY level {1:F2} - Description: '{2}' (UseGLLevels={3}, KeywordGL='{4}')",
+						Time[0], currentLevelPrice, description, UseGLLevels, KeywordGL.ToLower()));
+
+					// Apply LBL filter if enabled
+					if (UseLBLFilter)
+					{
+						bool hasLBL = description.Contains("lbl");
+
+						// If RequireLBLInDescription is true, only trade levels WITH "LBL"
+						// If RequireLBLInDescription is false, only trade levels WITHOUT "LBL"
+						if (RequireLBLInDescription && !hasLBL)
+						{
+							Print(string.Format("  -> Skipped: LBL filter (requires LBL but not found)"));
+							continue;
+						}
+						if (!RequireLBLInDescription && hasLBL)
+						{
+							Print(string.Format("  -> Skipped: LBL filter (excludes LBL but found)"));
+							continue;
+						}
+					}
+
+					bool isBuyLevel = false;
+
+					// Standard keyword checks
+					if (UseSupport && description.Contains(KeywordSupport.ToLower()))
+					{
+						isBuyLevel = true;
+						Print(string.Format("  -> Matched Support keyword"));
+					}
+					if (UsePivotBull && description.Contains(KeywordPivotBull.ToLower()))
+					{
+						isBuyLevel = true;
+						Print(string.Format("  -> Matched Pivot Bull keyword"));
+					}
+					if (UseStrengthConfirmed && description.Contains(KeywordStrengthConfirmed.ToLower()))
+					{
+						isBuyLevel = true;
+						Print(string.Format("  -> Matched Strength Confirmed keyword"));
+					}
+
+					// GL levels: if GL is BELOW current price, treat as support
+					if (UseGLLevels && description.Contains(KeywordGL.ToLower()) && currentLevelPrice < currentPrice)
+					{
+						isBuyLevel = true;
+						Print(string.Format("  -> GL level at {1:F2} is BELOW price {2:F2} - treating as SUPPORT", Time[0], currentLevelPrice, currentPrice));
+					}
+					else if (UseGLLevels && description.Contains(KeywordGL.ToLower()) && currentLevelPrice >= currentPrice)
+					{
+						Print(string.Format("  -> GL level at {1:F2} is NOT below price {2:F2} - NOT a buy level", Time[0], currentLevelPrice, currentPrice));
+					}
+					else if (UseGLLevels && !description.Contains(KeywordGL.ToLower()))
+					{
+						Print(string.Format("  -> GL enabled but description doesn't contain '{0}'", KeywordGL.ToLower()));
+					}
+
+					if (isBuyLevel)
+					{
+						// Check if we have cross tracking info for this level
+						if (levelCrossTracker.ContainsKey(currentLevelPrice))
+						{
+							var crossInfo = levelCrossTracker[currentLevelPrice];
+
+							// For BUY at support: Price crossed below the level, now retracing back above
+							if (crossInfo.CrossedBelow && previousPrice < currentLevelPrice && currentPrice >= currentLevelPrice)
+							{
+								Print(string.Format("{0}: BUY Signal - Price retraced back above {1} at {2:F2} after crossing below", Time[0], description, currentLevelPrice));
+								crossInfo.CrossedBelow = false;
+								levelPrice = currentLevelPrice;
+								return true;
+							}
+						}
+
+						// Also allow immediate touch/crossover if configured
+						if (TradeOnCrossover)
+						{
+							// For support: Enter on initial cross below then back above
+							if (previousPrice < currentLevelPrice - proximity && currentPrice >= currentLevelPrice)
+							{
+								Print(string.Format("{0}: BUY Signal - Price crossed above {1} at {2:F2}", Time[0], description, currentLevelPrice));
+								levelPrice = currentLevelPrice;
+								return true;
+							}
+						}
+
+						if (TradeOnTouch)
+						{
+							// Touch from below
+							if (currentPrice >= currentLevelPrice - proximity && currentPrice <= currentLevelPrice + proximity)
+							{
+								Print(string.Format("{0}: BUY Signal - Price touching {1} at {2:F2}", Time[0], description, currentLevelPrice));
+								levelPrice = currentLevelPrice;
+								return true;
+							}
+						}
+					}
+					else
+					{
+						// Diagnostic output for levels that don't match
+						if (description.Contains(KeywordGL.ToLower()))
+						{
+							Print(string.Format("{0}: Level {1:F2} '{2}' - Not a BUY level (GL is above price, checking: UseGLLevels={3})", Time[0], currentLevelPrice, description, UseGLLevels));
+						}
+					}
+				}
+
+				return false;
+			}
+		}
+
+		private bool ShouldSellAtLevel(double currentPrice, double previousPrice, out double levelPrice)
+		{
+			levelPrice = 0;
+
+			lock (priceLevels)
+			{
+				if (priceLevels.Count == 0)
+					return false;
+
+				double proximity = PriceProximityTicks * TickSize;
+
+				foreach (var level in priceLevels)
+				{
+					double currentLevelPrice = level.Key;
+					string description = level.Value.ToLower();
+
+					// Check if level is on cooldown
+					if (IsLevelOnCooldown(currentLevelPrice))
+					{
+						continue;
+					}
+
+					// DIAGNOSTIC: Print what we're checking
+					Print(string.Format("{0}: Checking SELL level {1:F2} - Description: '{2}' (UseGLLevels={3}, KeywordGL='{4}')",
+						Time[0], currentLevelPrice, description, UseGLLevels, KeywordGL.ToLower()));
+
+					// Apply LBL filter if enabled
+					if (UseLBLFilter)
+					{
+						bool hasLBL = description.Contains("lbl");
+
+						// If RequireLBLInDescription is true, only trade levels WITH "LBL"
+						// If RequireLBLInDescription is false, only trade levels WITHOUT "LBL"
+						if (RequireLBLInDescription && !hasLBL)
+						{
+							Print(string.Format("  -> Skipped: LBL filter (requires LBL but not found)"));
+							continue;
+						}
+						if (!RequireLBLInDescription && hasLBL)
+						{
+							Print(string.Format("  -> Skipped: LBL filter (excludes LBL but found)"));
+							continue;
+						}
+					}
+
+					bool isSellLevel = false;
+
+					// Standard keyword checks
+					if (UseResistance && description.Contains(KeywordResistance.ToLower()))
+					{
+						isSellLevel = true;
+						Print(string.Format("  -> Matched Resistance keyword"));
+					}
+					if (UsePivotBear && description.Contains(KeywordPivotBear.ToLower()))
+					{
+						isSellLevel = true;
+						Print(string.Format("  -> Matched Pivot Bear keyword"));
+					}
+					if (UseWeaknessConfirmed && description.Contains(KeywordWeaknessConfirmed.ToLower()))
+					{
+						isSellLevel = true;
+						Print(string.Format("  -> Matched Weakness Confirmed keyword"));
+					}
+
+					// GL levels: if GL is ABOVE current price, treat as resistance
+					if (UseGLLevels && description.Contains(KeywordGL.ToLower()) && currentLevelPrice > currentPrice)
+					{
+						isSellLevel = true;
+						Print(string.Format("  -> GL level at {1:F2} is ABOVE price {2:F2} - treating as RESISTANCE", Time[0], currentLevelPrice, currentPrice));
+					}
+					else if (UseGLLevels && description.Contains(KeywordGL.ToLower()) && currentLevelPrice <= currentPrice)
+					{
+						Print(string.Format("  -> GL level at {1:F2} is NOT above price {2:F2} - NOT a sell level", Time[0], currentLevelPrice, currentPrice));
+					}
+					else if (UseGLLevels && !description.Contains(KeywordGL.ToLower()))
+					{
+						Print(string.Format("  -> GL enabled but description doesn't contain '{0}'", KeywordGL.ToLower()));
+					}
+
+					if (isSellLevel)
+					{
+						// Check if we have cross tracking info for this level
+						if (levelCrossTracker.ContainsKey(currentLevelPrice))
+						{
+							var crossInfo = levelCrossTracker[currentLevelPrice];
+
+							// For SELL at resistance: Price crossed above the level, now retracing back below
+							if (crossInfo.CrossedAbove && previousPrice > currentLevelPrice && currentPrice <= currentLevelPrice)
+							{
+								Print(string.Format("{0}: SELL Signal - Price retraced back below {1} at {2:F2} after crossing above", Time[0], description, currentLevelPrice));
+								crossInfo.CrossedAbove = false;
+								levelPrice = currentLevelPrice;
+								return true;
+							}
+						}
+
+						// Also allow immediate touch/crossover if configured
+						if (TradeOnCrossover)
+						{
+							// For resistance: Enter on initial cross above then back below
+							if (previousPrice > currentLevelPrice + proximity && currentPrice <= currentLevelPrice)
+							{
+								Print(string.Format("{0}: SELL Signal - Price crossed below {1} at {2:F2}", Time[0], description, currentLevelPrice));
+								levelPrice = currentLevelPrice;
+								return true;
+							}
+						}
+
+						if (TradeOnTouch)
+						{
+							// Touch from above
+							if (currentPrice >= currentLevelPrice - proximity && currentPrice <= currentLevelPrice + proximity)
+							{
+								Print(string.Format("{0}: SELL Signal - Price touching {1} at {2:F2}", Time[0], description, currentLevelPrice));
+								levelPrice = currentLevelPrice;
+								return true;
+							}
+						}
+					}
+					else
+					{
+						// Diagnostic output for levels that don't match
+						if (description.Contains(KeywordGL.ToLower()))
+						{
+							Print(string.Format("{0}: Level {1:F2} '{2}' - Not a SELL level (GL is below price, checking: UseGLLevels={3})", Time[0], currentLevelPrice, description, UseGLLevels));
+						}
+					}
+				}
+
+				return false;
+			}
+		}
+
+		#region Properties
+
+		[NinjaScriptProperty]
+		[Display(Name="Use Support Levels", Description="Enable trading at Support levels", Order=1, GroupName="1) Level Types")]
+		public bool UseSupport
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Use Resistance Levels", Description="Enable trading at Resistance levels", Order=2, GroupName="1) Level Types")]
+		public bool UseResistance
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Use Pivot Bull Levels", Description="Enable trading at Pivot Bull levels", Order=3, GroupName="1) Level Types")]
+		public bool UsePivotBull
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Use Pivot Bear Levels", Description="Enable trading at Pivot Bear levels", Order=4, GroupName="1) Level Types")]
+		public bool UsePivotBear
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Use Strength Confirmed", Description="Enable trading at Strength Confirmed levels", Order=5, GroupName="1) Level Types")]
+		public bool UseStrengthConfirmed
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Use Weakness Confirmed", Description="Enable trading at Weakness Confirmed levels", Order=6, GroupName="1) Level Types")]
+		public bool UseWeaknessConfirmed
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Use GL Levels (Dynamic)", Description="Enable trading at GL levels (above price = resistance, below price = support)", Order=7, GroupName="1) Level Types")]
+		public bool UseGLLevels
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, int.MaxValue)]
+		[Display(Name="Price Proximity (Ticks)", Description="How close price must be to trigger (in ticks)", Order=1, GroupName="2) Entry Rules")]
+		public int PriceProximityTicks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Trade on Crossover", Description="Enter when price crosses the level", Order=2, GroupName="2) Entry Rules")]
+		public bool TradeOnCrossover
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Trade on Touch", Description="Enter when price touches/is near the level", Order=3, GroupName="2) Entry Rules")]
+		public bool TradeOnTouch
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Use LBL Filter", Description="Enable filtering based on LBL keyword in descriptions", Order=4, GroupName="2) Entry Rules")]
+		public bool UseLBLFilter
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Require LBL in Description", Description="If enabled: only trade levels WITH 'LBL'. If disabled: only trade levels WITHOUT 'LBL'", Order=5, GroupName="2) Entry Rules")]
+		public bool RequireLBLInDescription
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Enable Multi-Contract", Description="Trade 2 contracts with independent trailing stops", Order=1, GroupName="3) Exit Management")]
+		public bool EnableMultiContract
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Enable Stop Loss (Basic)", Description="Use basic stop loss orders (disabled when Complex Trailing enabled)", Order=2, GroupName="3) Exit Management")]
+		public bool EnableStopLoss
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Stop Loss (Ticks)", Description="Stop loss distance in ticks", Order=3, GroupName="3) Exit Management")]
+		public int StopLossTicks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Enable Profit Target (Basic)", Description="Use basic profit target orders (disabled when Complex Trailing enabled)", Order=4, GroupName="3) Exit Management")]
+		public bool EnableProfitTarget
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Profit Target (Ticks)", Description="Profit target distance in ticks", Order=5, GroupName="3) Exit Management")]
+		public int ProfitTargetTicks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Enable Trail Stop (Basic)", Description="Use basic trailing stop orders (disabled when Complex Trailing enabled)", Order=6, GroupName="3) Exit Management")]
+		public bool EnableTrailStop
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Trail Stop (Ticks)", Description="Trailing stop distance in ticks", Order=7, GroupName="3) Exit Management")]
+		public int TrailStopTicks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Enable Complex Trailing Stop", Description="Use multi-tier trailing stop system (overrides basic stops)", Order=8, GroupName="3) Exit Management")]
+		public bool EnableComplexTrailingStop
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Use Percentage-Based Trailing", Description="Use percentage of entry price instead of fixed ticks", Order=9, GroupName="3) Exit Management")]
+		public bool UsePercentageBasedTrailing
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0.1, 2.0)]
+		[Display(Name="Percentage Trail Offset (%)", Description="Trail offset as percentage of entry price (e.g., 0.4 = 0.4%)", Order=10, GroupName="3) Exit Management")]
+		public double PercentageTrailOffset
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Contract 1: Initial Trail (Ticks)", Description="Initial trailing stop distance for first contract", Order=11, GroupName="3) Exit Management")]
+		public int Contract1_TrailingInitialTicks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Contract 1: Step 1 Trail (Ticks)", Description="Trailing distance after reaching Step 1 trigger", Order=12, GroupName="3) Exit Management")]
+		public int Contract1_Step1Ticks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Contract 1: Step 1 Trigger (Ticks)", Description="Profit ticks to activate Step 1 trail", Order=13, GroupName="3) Exit Management")]
+		public int Contract1_Step1TriggerTicks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Contract 1: Step 2 Trail (Ticks)", Description="Trailing distance after reaching Step 2 trigger", Order=14, GroupName="3) Exit Management")]
+		public int Contract1_Step2Ticks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Contract 1: Step 2 Trigger (Ticks)", Description="Profit ticks to activate Step 2 trail", Order=15, GroupName="3) Exit Management")]
+		public int Contract1_Step2TriggerTicks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Contract 1: Step 3 Trail (Ticks)", Description="Trailing distance after reaching Step 3 trigger", Order=16, GroupName="3) Exit Management")]
+		public int Contract1_Step3Ticks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Contract 1: Step 3 Trigger (Ticks)", Description="Profit ticks to activate Step 3 trail", Order=17, GroupName="3) Exit Management")]
+		public int Contract1_Step3TriggerTicks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Enable Contract 2 Settings", Description="Use different settings for second contract (only if Multi-Contract enabled)", Order=18, GroupName="3) Exit Management")]
+		public bool EnableContract2Settings
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Contract 2: Initial Trail (Ticks)", Description="Initial trailing stop distance for second contract", Order=19, GroupName="3) Exit Management")]
+		public int Contract2_TrailingInitialTicks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Contract 2: Step 1 Trail (Ticks)", Description="Trailing distance after reaching Step 1 trigger", Order=20, GroupName="3) Exit Management")]
+		public int Contract2_Step1Ticks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Contract 2: Step 1 Trigger (Ticks)", Description="Profit ticks to activate Step 1 trail", Order=21, GroupName="3) Exit Management")]
+		public int Contract2_Step1TriggerTicks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Contract 2: Step 2 Trail (Ticks)", Description="Trailing distance after reaching Step 2 trigger", Order=22, GroupName="3) Exit Management")]
+		public int Contract2_Step2Ticks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Contract 2: Step 2 Trigger (Ticks)", Description="Profit ticks to activate Step 2 trail", Order=23, GroupName="3) Exit Management")]
+		public int Contract2_Step2TriggerTicks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Contract 2: Step 3 Trail (Ticks)", Description="Trailing distance after reaching Step 3 trigger", Order=24, GroupName="3) Exit Management")]
+		public int Contract2_Step3Ticks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Contract 2: Step 3 Trigger (Ticks)", Description="Profit ticks to activate Step 3 trail", Order=25, GroupName="3) Exit Management")]
+		public int Contract2_Step3TriggerTicks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, 100)]
+		[Display(Name="Minimum Stop Distance (Ticks)", Description="Minimum buffer between stop price and market price", Order=26, GroupName="3) Exit Management")]
+		public int MinimumStopDistanceTicks
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Enable Stop Calculation Delay", Description="Add delay between stop recalculations to prevent chasing price", Order=27, GroupName="3) Exit Management")]
+		public bool EnableStopCalculationDelay
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Support Keyword", Description="Keyword to identify support levels", Order=1, GroupName="4) Keywords")]
+		public string KeywordSupport
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Resistance Keyword", Description="Keyword to identify resistance levels", Order=2, GroupName="4) Keywords")]
+		public string KeywordResistance
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Pivot Bull Keyword", Description="Keyword to identify pivot bull levels", Order=3, GroupName="4) Keywords")]
+		public string KeywordPivotBull
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Pivot Bear Keyword", Description="Keyword to identify pivot bear levels", Order=4, GroupName="4) Keywords")]
+		public string KeywordPivotBear
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Strength Confirmed Keyword", Description="Keyword to identify strength confirmed levels", Order=5, GroupName="4) Keywords")]
+		public string KeywordStrengthConfirmed
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Weakness Confirmed Keyword", Description="Keyword to identify weakness confirmed levels", Order=6, GroupName="4) Keywords")]
+		public string KeywordWeaknessConfirmed
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="GL Keyword", Description="Keyword to identify GL (Golden Level) levels", Order=7, GroupName="4) Keywords")]
+		public string KeywordGL
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Enable Time Filter", Description="Only trade during specific hours (EST)", Order=1, GroupName="5) Time Filter")]
+		public bool EnableTimeFilter
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 23)]
+		[Display(Name="Trading Start Hour", Description="Trading start hour (0-23, EST)", Order=2, GroupName="5) Time Filter")]
+		public int TradingStartHour
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 59)]
+		[Display(Name="Trading Start Minute", Description="Trading start minute (0-59)", Order=3, GroupName="5) Time Filter")]
+		public int TradingStartMinute
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 23)]
+		[Display(Name="Trading End Hour", Description="Trading end hour (0-23, EST)", Order=4, GroupName="5) Time Filter")]
+		public int TradingEndHour
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 59)]
+		[Display(Name="Trading End Minute", Description="Trading end minute (0-59)", Order=5, GroupName="5) Time Filter")]
+		public int TradingEndMinute
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Enable Daily Loss Limit", Description="Stop trading after reaching daily loss limit", Order=1, GroupName="6) Daily Limits")]
+		public bool EnableDailyLossLimit
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, double.MaxValue)]
+		[Display(Name="Daily Loss Limit ($)", Description="Maximum daily loss in dollars", Order=2, GroupName="6) Daily Limits")]
+		public double DailyLossLimit
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Enable Daily Target Limit", Description="Stop trading after reaching daily profit target", Order=3, GroupName="6) Daily Limits")]
+		public bool EnableDailyTargetLimit
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, double.MaxValue)]
+		[Display(Name="Daily Target Limit ($)", Description="Maximum daily profit target in dollars", Order=4, GroupName="6) Daily Limits")]
+		public double DailyTargetLimit
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Enable Level Cooldown", Description="Enforce minimum time between trades at same level", Order=1, GroupName="7) Level Cooldown")]
+		public bool EnableLevelCooldown
+		{ get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, 1440)]
+		[Display(Name="Cooldown Minutes", Description="Minimum minutes between trades at same level", Order=2, GroupName="7) Level Cooldown")]
+		public int LevelCooldownMinutes
+		{ get; set; }
+
+		#endregion
+	}
+}
