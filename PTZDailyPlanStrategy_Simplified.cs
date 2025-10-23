@@ -37,17 +37,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private bool dailyLimitReached;
 		private Dictionary<double, DateTime> levelLastTradeTime;
 
-		private double contract1ExitPrice;
-		private double contract2StopPrice;
-		private double initialStopPrice;
+		private Order contract1StopOrder;
+		private Order contract1TargetOrder;
+		private Order contract2StopOrder;
+		private Order contract2TargetOrder;
 		private bool contract1Exited;
 		private bool contract2BreakevenSet;
-		private bool initialStopHit;
-
-		private string c1TargetTag = "C1_Target";
-		private string c2TargetTag = "C2_Target";
-		private string c2StopTag = "C2_Stop";
-		private string initialStopTag = "Initial_Stop";
+		private double contract2TrailPrice;
 
 		private class LevelCrossInfo
 		{
@@ -61,7 +57,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		{
 			if (State == State.SetDefaults)
 			{
-				Description = @"Simplified trailing system: 1 or 2 contracts with 22-tick initial stop, visual targets/stops";
+				Description = @"Simplified trailing system with native NT8 stop/target orders";
 				Name = "PTZ Daily Plan Strategy (Simplified)";
 				Calculate = Calculate.OnPriceChange;
 				EntriesPerDirection = 1;
@@ -96,7 +92,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 				RequireLBLInDescription = false;
 
 				NumberOfContracts = 2;
-				InitialStopTicks = 22;
+				Contract1InitialStopTicks = 22;
+				Contract2InitialStopTicks = 22;
 
 				Contract1ScalpTicks = 7;
 				Contract1BreakevenTicks = 4;
@@ -143,12 +140,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 				dailyLimitReached = false;
 				levelLastTradeTime = new Dictionary<double, DateTime>();
 
-				contract1ExitPrice = 0;
-				contract2StopPrice = 0;
-				initialStopPrice = 0;
+				contract1StopOrder = null;
+				contract1TargetOrder = null;
+				contract2StopOrder = null;
+				contract2TargetOrder = null;
 				contract1Exited = false;
 				contract2BreakevenSet = false;
-				initialStopHit = false;
+				contract2TrailPrice = 0;
 			}
 		}
 
@@ -214,71 +212,77 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 		}
 
+		protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice, int quantity, int filled, double averageFillPrice, OrderState orderState, DateTime time, ErrorCode error, string nativeError)
+		{
+			if (order == null)
+				return;
+
+			if (order == contract1StopOrder || order == contract1TargetOrder)
+			{
+				if (orderState == OrderState.Filled || orderState == OrderState.PartFilled)
+				{
+					contract1Exited = true;
+					Print(string.Format("{0}: Contract 1 exited via {1}", Time[0], order.Name));
+				}
+			}
+
+			if (order == contract2StopOrder || order == contract2TargetOrder)
+			{
+				if (orderState == OrderState.Filled)
+				{
+					Print(string.Format("{0}: Contract 2 exited via {1}", Time[0], order.Name));
+				}
+			}
+		}
+
 		private void ManageTrailingExits()
 		{
 			try
 			{
+				if (Position.MarketPosition == MarketPosition.Flat)
+					return;
+
 				double currentPrice = Close[0];
 				double entryPrice = Position.AveragePrice;
 				double profitTicks = 0;
-
-				UpdateChartDrawings();
 
 				if (Position.MarketPosition == MarketPosition.Long)
 				{
 					profitTicks = (currentPrice - entryPrice) / TickSize;
 
-					if (!initialStopHit && currentPrice <= initialStopPrice)
+					if (NumberOfContracts == 2 && Position.Quantity == 2 && !contract1Exited)
 					{
-						ExitLong("Initial_Stop");
-						initialStopHit = true;
-						Print(string.Format("{0}: LONG initial stop hit at {1:F2}", Time[0], currentPrice));
-						return;
-					}
-
-					if (NumberOfContracts == 2 && Position.Quantity >= 2 && !contract1Exited)
-					{
-						if (profitTicks >= Contract1ScalpTicks)
+						if (profitTicks >= Contract1BreakevenTicks && contract1StopOrder != null)
 						{
-							ExitLong(1, "C1_Scalp", "");
-							contract1Exited = true;
-							Print(string.Format("{0}: LONG C1 exited at {1:F2} ({2:F1} tick profit)",
-								Time[0], currentPrice, profitTicks));
+							double newStopPrice = entryPrice;
+							if (contract1StopOrder.StopPrice != newStopPrice)
+							{
+								contract1StopOrder = ExitLongStopMarket(0, true, 1, newStopPrice, "C1_Stop", "EntryLong");
+								Print(string.Format("{0}: C1 LONG stop moved to breakeven at {1:F2}", Time[0], newStopPrice));
+							}
 						}
 					}
 
-					if (Position.Quantity >= 1)
+					if (Position.Quantity >= 1 && contract2StopOrder != null)
 					{
 						if (!contract2BreakevenSet && profitTicks >= Contract2BreakevenTicks)
 						{
-							contract2StopPrice = entryPrice;
+							contract2TrailPrice = entryPrice;
 							contract2BreakevenSet = true;
-							Print(string.Format("{0}: LONG C2 breakeven set at {1:F2}", Time[0], contract2StopPrice));
+							contract2StopOrder = ExitLongStopMarket(0, true, contract2StopOrder.Quantity, contract2TrailPrice, "C2_Stop", "EntryLong");
+							Print(string.Format("{0}: C2 LONG stop moved to breakeven at {1:F2}", Time[0], contract2TrailPrice));
 						}
 
 						if (contract2BreakevenSet)
 						{
-							double newStopPrice = currentPrice - (Contract2TrailTicks * TickSize);
-
-							if (newStopPrice > contract2StopPrice)
+							double newTrailPrice = currentPrice - (Contract2TrailTicks * TickSize);
+							if (newTrailPrice > contract2TrailPrice)
 							{
-								contract2StopPrice = newStopPrice;
-								Print(string.Format("{0}: LONG C2 trail updated to {1:F2} (Price: {2:F2}, Profit: {3:F1} ticks)",
-									Time[0], contract2StopPrice, currentPrice, profitTicks));
+								contract2TrailPrice = newTrailPrice;
+								contract2StopOrder = ExitLongStopMarket(0, true, contract2StopOrder.Quantity, contract2TrailPrice, "C2_Stop", "EntryLong");
+								Print(string.Format("{0}: C2 LONG trail updated to {1:F2} (Profit: {2:F1} ticks)",
+									Time[0], contract2TrailPrice, profitTicks));
 							}
-
-							if (currentPrice <= contract2StopPrice)
-							{
-								ExitLong("C2_Trail", "");
-								Print(string.Format("{0}: LONG C2 trail stop hit at {1:F2}", Time[0], currentPrice));
-							}
-						}
-
-						if (profitTicks >= Contract2TargetTicks)
-						{
-							ExitLong("C2_Target", "");
-							Print(string.Format("{0}: LONG C2 target hit at {1:F2} ({2:F1} tick profit)",
-								Time[0], currentPrice, profitTicks));
 						}
 					}
 				}
@@ -286,57 +290,39 @@ namespace NinjaTrader.NinjaScript.Strategies
 				{
 					profitTicks = (entryPrice - currentPrice) / TickSize;
 
-					if (!initialStopHit && currentPrice >= initialStopPrice)
+					if (NumberOfContracts == 2 && Position.Quantity == 2 && !contract1Exited)
 					{
-						ExitShort("Initial_Stop");
-						initialStopHit = true;
-						Print(string.Format("{0}: SHORT initial stop hit at {1:F2}", Time[0], currentPrice));
-						return;
-					}
-
-					if (NumberOfContracts == 2 && Position.Quantity >= 2 && !contract1Exited)
-					{
-						if (profitTicks >= Contract1ScalpTicks)
+						if (profitTicks >= Contract1BreakevenTicks && contract1StopOrder != null)
 						{
-							ExitShort(1, "C1_Scalp", "");
-							contract1Exited = true;
-							Print(string.Format("{0}: SHORT C1 exited at {1:F2} ({2:F1} tick profit)",
-								Time[0], currentPrice, profitTicks));
+							double newStopPrice = entryPrice;
+							if (contract1StopOrder.StopPrice != newStopPrice)
+							{
+								contract1StopOrder = ExitShortStopMarket(0, true, 1, newStopPrice, "C1_Stop", "EntryShort");
+								Print(string.Format("{0}: C1 SHORT stop moved to breakeven at {1:F2}", Time[0], newStopPrice));
+							}
 						}
 					}
 
-					if (Position.Quantity >= 1)
+					if (Position.Quantity >= 1 && contract2StopOrder != null)
 					{
 						if (!contract2BreakevenSet && profitTicks >= Contract2BreakevenTicks)
 						{
-							contract2StopPrice = entryPrice;
+							contract2TrailPrice = entryPrice;
 							contract2BreakevenSet = true;
-							Print(string.Format("{0}: SHORT C2 breakeven set at {1:F2}", Time[0], contract2StopPrice));
+							contract2StopOrder = ExitShortStopMarket(0, true, contract2StopOrder.Quantity, contract2TrailPrice, "C2_Stop", "EntryShort");
+							Print(string.Format("{0}: C2 SHORT stop moved to breakeven at {1:F2}", Time[0], contract2TrailPrice));
 						}
 
 						if (contract2BreakevenSet)
 						{
-							double newStopPrice = currentPrice + (Contract2TrailTicks * TickSize);
-
-							if (contract2StopPrice == 0 || newStopPrice < contract2StopPrice)
+							double newTrailPrice = currentPrice + (Contract2TrailTicks * TickSize);
+							if (newTrailPrice < contract2TrailPrice)
 							{
-								contract2StopPrice = newStopPrice;
-								Print(string.Format("{0}: SHORT C2 trail updated to {1:F2} (Price: {2:F2}, Profit: {3:F1} ticks)",
-									Time[0], contract2StopPrice, currentPrice, profitTicks));
+								contract2TrailPrice = newTrailPrice;
+								contract2StopOrder = ExitShortStopMarket(0, true, contract2StopOrder.Quantity, contract2TrailPrice, "C2_Stop", "EntryShort");
+								Print(string.Format("{0}: C2 SHORT trail updated to {1:F2} (Profit: {2:F1} ticks)",
+									Time[0], contract2TrailPrice, profitTicks));
 							}
-
-							if (currentPrice >= contract2StopPrice)
-							{
-								ExitShort("C2_Trail", "");
-								Print(string.Format("{0}: SHORT C2 trail stop hit at {1:F2}", Time[0], currentPrice));
-							}
-						}
-
-						if (profitTicks >= Contract2TargetTicks)
-						{
-							ExitShort("C2_Target", "");
-							Print(string.Format("{0}: SHORT C2 target hit at {1:F2} ({2:F1} tick profit)",
-								Time[0], currentPrice, profitTicks));
 						}
 					}
 				}
@@ -357,20 +343,42 @@ namespace NinjaTrader.NinjaScript.Strategies
 			{
 				try
 				{
-					EnterLong(NumberOfContracts, "Buy_Support");
+					EnterLong(NumberOfContracts, "EntryLong");
 
-					initialStopPrice = currentPrice - (InitialStopTicks * TickSize);
+					double entryPrice = currentPrice;
+
+					if (NumberOfContracts == 2)
+					{
+						double c1Stop = entryPrice - (Contract1InitialStopTicks * TickSize);
+						double c1Target = entryPrice + (Contract1ScalpTicks * TickSize);
+
+						contract1StopOrder = ExitLongStopMarket(0, true, 1, c1Stop, "C1_Stop", "EntryLong");
+						contract1TargetOrder = ExitLongLimit(0, true, 1, c1Target, "C1_Target", "EntryLong");
+
+						Print(string.Format("{0}: C1 LONG orders placed - Stop: {1:F2}, Target: {2:F2}",
+							Time[0], c1Stop, c1Target));
+					}
+
+					int c2Qty = NumberOfContracts == 2 ? 1 : 1;
+					double c2Stop = entryPrice - (Contract2InitialStopTicks * TickSize);
+					double c2Target = entryPrice + (Contract2TargetTicks * TickSize);
+
+					contract2StopOrder = ExitLongStopMarket(0, true, c2Qty, c2Stop, "C2_Stop", "EntryLong");
+					contract2TargetOrder = ExitLongLimit(0, true, c2Qty, c2Target, "C2_Target", "EntryLong");
+
+					Print(string.Format("{0}: C2 LONG orders placed - Stop: {1:F2}, Target: {2:F2}",
+						Time[0], c2Stop, c2Target));
+
 					contract1Exited = false;
 					contract2BreakevenSet = false;
-					contract2StopPrice = 0;
-					initialStopHit = false;
+					contract2TrailPrice = c2Stop;
 
 					if (EnableLevelCooldown && buyLevelPrice > 0)
 					{
 						levelLastTradeTime[buyLevelPrice] = Time[0];
 					}
 
-					Print(string.Format("{0}: LONG entry at {1:F2}", Time[0], currentPrice));
+					Print(string.Format("{0}: LONG entry at {1:F2} with {2} contracts", Time[0], currentPrice, NumberOfContracts));
 				}
 				catch (Exception ex)
 				{
@@ -389,20 +397,42 @@ namespace NinjaTrader.NinjaScript.Strategies
 			{
 				try
 				{
-					EnterShort(NumberOfContracts, "Sell_Resistance");
+					EnterShort(NumberOfContracts, "EntryShort");
 
-					initialStopPrice = currentPrice + (InitialStopTicks * TickSize);
+					double entryPrice = currentPrice;
+
+					if (NumberOfContracts == 2)
+					{
+						double c1Stop = entryPrice + (Contract1InitialStopTicks * TickSize);
+						double c1Target = entryPrice - (Contract1ScalpTicks * TickSize);
+
+						contract1StopOrder = ExitShortStopMarket(0, true, 1, c1Stop, "C1_Stop", "EntryShort");
+						contract1TargetOrder = ExitShortLimit(0, true, 1, c1Target, "C1_Target", "EntryShort");
+
+						Print(string.Format("{0}: C1 SHORT orders placed - Stop: {1:F2}, Target: {2:F2}",
+							Time[0], c1Stop, c1Target));
+					}
+
+					int c2Qty = NumberOfContracts == 2 ? 1 : 1;
+					double c2Stop = entryPrice + (Contract2InitialStopTicks * TickSize);
+					double c2Target = entryPrice - (Contract2TargetTicks * TickSize);
+
+					contract2StopOrder = ExitShortStopMarket(0, true, c2Qty, c2Stop, "C2_Stop", "EntryShort");
+					contract2TargetOrder = ExitShortLimit(0, true, c2Qty, c2Target, "C2_Target", "EntryShort");
+
+					Print(string.Format("{0}: C2 SHORT orders placed - Stop: {1:F2}, Target: {2:F2}",
+						Time[0], c2Stop, c2Target));
+
 					contract1Exited = false;
 					contract2BreakevenSet = false;
-					contract2StopPrice = 0;
-					initialStopHit = false;
+					contract2TrailPrice = c2Stop;
 
 					if (EnableLevelCooldown && sellLevelPrice > 0)
 					{
 						levelLastTradeTime[sellLevelPrice] = Time[0];
 					}
 
-					Print(string.Format("{0}: SHORT entry at {1:F2}", Time[0], currentPrice));
+					Print(string.Format("{0}: SHORT entry at {1:F2} with {2} contracts", Time[0], currentPrice, NumberOfContracts));
 				}
 				catch (Exception ex)
 				{
@@ -786,97 +816,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 					else if (Position.MarketPosition == MarketPosition.Short)
 						ExitShort("Emergency");
 
+					contract1StopOrder = null;
+					contract1TargetOrder = null;
+					contract2StopOrder = null;
+					contract2TargetOrder = null;
 					contract1Exited = false;
 					contract2BreakevenSet = false;
-					contract2StopPrice = 0;
-					initialStopPrice = 0;
-					initialStopHit = false;
-
-					RemoveChartDrawings();
+					contract2TrailPrice = 0;
 				}
 			}
 			catch (Exception ex)
 			{
 				Print(string.Format("{0}: ERROR closing positions: {1}", Time[0], ex.Message));
-			}
-		}
-
-		private void UpdateChartDrawings()
-		{
-			if (ChartControl == null || Position.MarketPosition == MarketPosition.Flat)
-				return;
-
-			try
-			{
-				double entryPrice = Position.AveragePrice;
-				int currentBar = CurrentBar;
-
-				if (Position.MarketPosition == MarketPosition.Long)
-				{
-					if (initialStopPrice > 0 && !initialStopHit)
-					{
-						Draw.Line(this, initialStopTag, false, 10, initialStopPrice, 0, initialStopPrice, Brushes.Red, DashStyleHelper.Solid, 2);
-					}
-
-					if (NumberOfContracts == 2 && !contract1Exited)
-					{
-						double c1Target = entryPrice + (Contract1ScalpTicks * TickSize);
-						Draw.Line(this, c1TargetTag, false, 10, c1Target, 0, c1Target, Brushes.LimeGreen, DashStyleHelper.Dash, 2);
-					}
-
-					if (Position.Quantity >= 1)
-					{
-						double c2Target = entryPrice + (Contract2TargetTicks * TickSize);
-						Draw.Line(this, c2TargetTag, false, 10, c2Target, 0, c2Target, Brushes.Cyan, DashStyleHelper.Dash, 2);
-
-						if (contract2StopPrice > 0)
-						{
-							Draw.Line(this, c2StopTag, false, 10, contract2StopPrice, 0, contract2StopPrice, Brushes.Orange, DashStyleHelper.Solid, 2);
-						}
-					}
-				}
-				else if (Position.MarketPosition == MarketPosition.Short)
-				{
-					if (initialStopPrice > 0 && !initialStopHit)
-					{
-						Draw.Line(this, initialStopTag, false, 10, initialStopPrice, 0, initialStopPrice, Brushes.Red, DashStyleHelper.Solid, 2);
-					}
-
-					if (NumberOfContracts == 2 && !contract1Exited)
-					{
-						double c1Target = entryPrice - (Contract1ScalpTicks * TickSize);
-						Draw.Line(this, c1TargetTag, false, 10, c1Target, 0, c1Target, Brushes.LimeGreen, DashStyleHelper.Dash, 2);
-					}
-
-					if (Position.Quantity >= 1)
-					{
-						double c2Target = entryPrice - (Contract2TargetTicks * TickSize);
-						Draw.Line(this, c2TargetTag, false, 10, c2Target, 0, c2Target, Brushes.Cyan, DashStyleHelper.Dash, 2);
-
-						if (contract2StopPrice > 0)
-						{
-							Draw.Line(this, c2StopTag, false, 10, contract2StopPrice, 0, contract2StopPrice, Brushes.Orange, DashStyleHelper.Solid, 2);
-						}
-					}
-				}
-			}
-			catch (Exception ex)
-			{
-				Print(string.Format("{0}: ERROR updating chart drawings: {1}", Time[0], ex.Message));
-			}
-		}
-
-		private void RemoveChartDrawings()
-		{
-			try
-			{
-				RemoveDrawObject(initialStopTag);
-				RemoveDrawObject(c1TargetTag);
-				RemoveDrawObject(c2TargetTag);
-				RemoveDrawObject(c2StopTag);
-			}
-			catch
-			{
 			}
 		}
 
@@ -938,32 +889,37 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name="Initial Stop Loss (Ticks)", Description="Initial stop loss for both contracts", Order=2, GroupName="3) Exit Settings")]
-		public int InitialStopTicks { get; set; }
+		[Display(Name="Contract 1: Initial Stop (Ticks)", Description="Initial stop loss for first contract", Order=2, GroupName="3) Exit Settings")]
+		public int Contract1InitialStopTicks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name="Contract 1: Scalp Target (Ticks)", Description="Quick exit profit target for first contract", Order=3, GroupName="3) Exit Settings")]
+		[Display(Name="Contract 2: Initial Stop (Ticks)", Description="Initial stop loss for second contract (or single contract)", Order=3, GroupName="3) Exit Settings")]
+		public int Contract2InitialStopTicks { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Contract 1: Scalp Target (Ticks)", Description="Quick exit profit target for first contract", Order=4, GroupName="3) Exit Settings")]
 		public int Contract1ScalpTicks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name="Contract 1: Breakeven (Ticks)", Description="Move to breakeven after this profit", Order=4, GroupName="3) Exit Settings")]
+		[Display(Name="Contract 1: Breakeven (Ticks)", Description="Move to breakeven after this profit", Order=5, GroupName="3) Exit Settings")]
 		public int Contract1BreakevenTicks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name="Contract 2: Profit Target (Ticks)", Description="Final profit target for runner", Order=5, GroupName="3) Exit Settings")]
+		[Display(Name="Contract 2: Profit Target (Ticks)", Description="Final profit target for runner", Order=6, GroupName="3) Exit Settings")]
 		public int Contract2TargetTicks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name="Contract 2: Breakeven (Ticks)", Description="Move to breakeven after this profit", Order=6, GroupName="3) Exit Settings")]
+		[Display(Name="Contract 2: Breakeven (Ticks)", Description="Move to breakeven after this profit", Order=7, GroupName="3) Exit Settings")]
 		public int Contract2BreakevenTicks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name="Contract 2: Trail Distance (Ticks)", Description="Trail stop distance behind price", Order=7, GroupName="3) Exit Settings")]
+		[Display(Name="Contract 2: Trail Distance (Ticks)", Description="Trail stop distance behind price", Order=8, GroupName="3) Exit Settings")]
 		public int Contract2TrailTicks { get; set; }
 
 		[NinjaScriptProperty]
