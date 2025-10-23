@@ -39,8 +39,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 		private double contract1ExitPrice;
 		private double contract2StopPrice;
+		private double initialStopPrice;
 		private bool contract1Exited;
 		private bool contract2BreakevenSet;
+		private bool initialStopHit;
+
+		private string c1TargetTag = "C1_Target";
+		private string c2TargetTag = "C2_Target";
+		private string c2StopTag = "C2_Stop";
+		private string initialStopTag = "Initial_Stop";
 
 		private class LevelCrossInfo
 		{
@@ -54,7 +61,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		{
 			if (State == State.SetDefaults)
 			{
-				Description = @"Simplified 2-contract trailing system: C1=7tick scalp, C2=80tick target with 7tick trail";
+				Description = @"Simplified trailing system: 1 or 2 contracts with 22-tick initial stop, visual targets/stops";
 				Name = "PTZ Daily Plan Strategy (Simplified)";
 				Calculate = Calculate.OnPriceChange;
 				EntriesPerDirection = 1;
@@ -87,6 +94,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 				UseLBLFilter = false;
 				RequireLBLInDescription = false;
+
+				NumberOfContracts = 2;
+				InitialStopTicks = 22;
 
 				Contract1ScalpTicks = 7;
 				Contract1BreakevenTicks = 4;
@@ -135,8 +145,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 				contract1ExitPrice = 0;
 				contract2StopPrice = 0;
+				initialStopPrice = 0;
 				contract1Exited = false;
 				contract2BreakevenSet = false;
+				initialStopHit = false;
 			}
 		}
 
@@ -210,11 +222,21 @@ namespace NinjaTrader.NinjaScript.Strategies
 				double entryPrice = Position.AveragePrice;
 				double profitTicks = 0;
 
+				UpdateChartDrawings();
+
 				if (Position.MarketPosition == MarketPosition.Long)
 				{
 					profitTicks = (currentPrice - entryPrice) / TickSize;
 
-					if (Position.Quantity >= 2 && !contract1Exited)
+					if (!initialStopHit && currentPrice <= initialStopPrice)
+					{
+						ExitLong("Initial_Stop");
+						initialStopHit = true;
+						Print(string.Format("{0}: LONG initial stop hit at {1:F2}", Time[0], currentPrice));
+						return;
+					}
+
+					if (NumberOfContracts == 2 && Position.Quantity >= 2 && !contract1Exited)
 					{
 						if (profitTicks >= Contract1ScalpTicks)
 						{
@@ -264,7 +286,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 				{
 					profitTicks = (entryPrice - currentPrice) / TickSize;
 
-					if (Position.Quantity >= 2 && !contract1Exited)
+					if (!initialStopHit && currentPrice >= initialStopPrice)
+					{
+						ExitShort("Initial_Stop");
+						initialStopHit = true;
+						Print(string.Format("{0}: SHORT initial stop hit at {1:F2}", Time[0], currentPrice));
+						return;
+					}
+
+					if (NumberOfContracts == 2 && Position.Quantity >= 2 && !contract1Exited)
 					{
 						if (profitTicks >= Contract1ScalpTicks)
 						{
@@ -327,11 +357,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 			{
 				try
 				{
-					EnterLong(2, "Buy_Support");
+					EnterLong(NumberOfContracts, "Buy_Support");
 
+					initialStopPrice = currentPrice - (InitialStopTicks * TickSize);
 					contract1Exited = false;
 					contract2BreakevenSet = false;
 					contract2StopPrice = 0;
+					initialStopHit = false;
 
 					if (EnableLevelCooldown && buyLevelPrice > 0)
 					{
@@ -357,11 +389,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 			{
 				try
 				{
-					EnterShort(2, "Sell_Resistance");
+					EnterShort(NumberOfContracts, "Sell_Resistance");
 
+					initialStopPrice = currentPrice + (InitialStopTicks * TickSize);
 					contract1Exited = false;
 					contract2BreakevenSet = false;
 					contract2StopPrice = 0;
+					initialStopHit = false;
 
 					if (EnableLevelCooldown && sellLevelPrice > 0)
 					{
@@ -755,11 +789,94 @@ namespace NinjaTrader.NinjaScript.Strategies
 					contract1Exited = false;
 					contract2BreakevenSet = false;
 					contract2StopPrice = 0;
+					initialStopPrice = 0;
+					initialStopHit = false;
+
+					RemoveChartDrawings();
 				}
 			}
 			catch (Exception ex)
 			{
 				Print(string.Format("{0}: ERROR closing positions: {1}", Time[0], ex.Message));
+			}
+		}
+
+		private void UpdateChartDrawings()
+		{
+			if (ChartControl == null || Position.MarketPosition == MarketPosition.Flat)
+				return;
+
+			try
+			{
+				double entryPrice = Position.AveragePrice;
+				int currentBar = CurrentBar;
+
+				if (Position.MarketPosition == MarketPosition.Long)
+				{
+					if (initialStopPrice > 0 && !initialStopHit)
+					{
+						Draw.Line(this, initialStopTag, false, 10, initialStopPrice, 0, initialStopPrice, Brushes.Red, DashStyleHelper.Solid, 2);
+					}
+
+					if (NumberOfContracts == 2 && !contract1Exited)
+					{
+						double c1Target = entryPrice + (Contract1ScalpTicks * TickSize);
+						Draw.Line(this, c1TargetTag, false, 10, c1Target, 0, c1Target, Brushes.LimeGreen, DashStyleHelper.Dash, 2);
+					}
+
+					if (Position.Quantity >= 1)
+					{
+						double c2Target = entryPrice + (Contract2TargetTicks * TickSize);
+						Draw.Line(this, c2TargetTag, false, 10, c2Target, 0, c2Target, Brushes.Cyan, DashStyleHelper.Dash, 2);
+
+						if (contract2StopPrice > 0)
+						{
+							Draw.Line(this, c2StopTag, false, 10, contract2StopPrice, 0, contract2StopPrice, Brushes.Orange, DashStyleHelper.Solid, 2);
+						}
+					}
+				}
+				else if (Position.MarketPosition == MarketPosition.Short)
+				{
+					if (initialStopPrice > 0 && !initialStopHit)
+					{
+						Draw.Line(this, initialStopTag, false, 10, initialStopPrice, 0, initialStopPrice, Brushes.Red, DashStyleHelper.Solid, 2);
+					}
+
+					if (NumberOfContracts == 2 && !contract1Exited)
+					{
+						double c1Target = entryPrice - (Contract1ScalpTicks * TickSize);
+						Draw.Line(this, c1TargetTag, false, 10, c1Target, 0, c1Target, Brushes.LimeGreen, DashStyleHelper.Dash, 2);
+					}
+
+					if (Position.Quantity >= 1)
+					{
+						double c2Target = entryPrice - (Contract2TargetTicks * TickSize);
+						Draw.Line(this, c2TargetTag, false, 10, c2Target, 0, c2Target, Brushes.Cyan, DashStyleHelper.Dash, 2);
+
+						if (contract2StopPrice > 0)
+						{
+							Draw.Line(this, c2StopTag, false, 10, contract2StopPrice, 0, contract2StopPrice, Brushes.Orange, DashStyleHelper.Solid, 2);
+						}
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				Print(string.Format("{0}: ERROR updating chart drawings: {1}", Time[0], ex.Message));
+			}
+		}
+
+		private void RemoveChartDrawings()
+		{
+			try
+			{
+				RemoveDrawObject(initialStopTag);
+				RemoveDrawObject(c1TargetTag);
+				RemoveDrawObject(c2TargetTag);
+				RemoveDrawObject(c2StopTag);
+			}
+			catch
+			{
 			}
 		}
 
@@ -815,28 +932,38 @@ namespace NinjaTrader.NinjaScript.Strategies
 		public bool RequireLBLInDescription { get; set; }
 
 		[NinjaScriptProperty]
+		[Range(1, 2)]
+		[Display(Name="Number of Contracts", Description="Trade 1 or 2 contracts", Order=1, GroupName="3) Exit Settings")]
+		public int NumberOfContracts { get; set; }
+
+		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name="Contract 1: Scalp Target (Ticks)", Description="Quick exit profit target for first contract", Order=1, GroupName="3) Exit Settings")]
+		[Display(Name="Initial Stop Loss (Ticks)", Description="Initial stop loss for both contracts", Order=2, GroupName="3) Exit Settings")]
+		public int InitialStopTicks { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name="Contract 1: Scalp Target (Ticks)", Description="Quick exit profit target for first contract", Order=3, GroupName="3) Exit Settings")]
 		public int Contract1ScalpTicks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name="Contract 1: Breakeven (Ticks)", Description="Move to breakeven after this profit", Order=2, GroupName="3) Exit Settings")]
+		[Display(Name="Contract 1: Breakeven (Ticks)", Description="Move to breakeven after this profit", Order=4, GroupName="3) Exit Settings")]
 		public int Contract1BreakevenTicks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name="Contract 2: Profit Target (Ticks)", Description="Final profit target for runner", Order=3, GroupName="3) Exit Settings")]
+		[Display(Name="Contract 2: Profit Target (Ticks)", Description="Final profit target for runner", Order=5, GroupName="3) Exit Settings")]
 		public int Contract2TargetTicks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name="Contract 2: Breakeven (Ticks)", Description="Move to breakeven after this profit", Order=4, GroupName="3) Exit Settings")]
+		[Display(Name="Contract 2: Breakeven (Ticks)", Description="Move to breakeven after this profit", Order=6, GroupName="3) Exit Settings")]
 		public int Contract2BreakevenTicks { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, int.MaxValue)]
-		[Display(Name="Contract 2: Trail Distance (Ticks)", Description="Trail stop distance behind price", Order=5, GroupName="3) Exit Settings")]
+		[Display(Name="Contract 2: Trail Distance (Ticks)", Description="Trail stop distance behind price", Order=7, GroupName="3) Exit Settings")]
 		public int Contract2TrailTicks { get; set; }
 
 		[NinjaScriptProperty]
